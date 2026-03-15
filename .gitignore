@@ -5,6 +5,7 @@ Dataset/
 .DS_Store
 .vscode
 Untitled-1.ipynb
+cnstats
 
 # Python-generated files
 __pycache__/
