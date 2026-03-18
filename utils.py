@@ -24,7 +24,9 @@ def numeric_cols(df):
         return []
     return df.select_dtypes(include=['number']).columns.tolist()
 
-def plot_population(dfs, labels, styles=None, figsize=(10,6), title='人口趋势'):
+def plot_population(dfs, labels, styles=None, figsize=(10,6), title='人口趋势',
+                    mark_negative=True, negative_marker='o', negative_color='red',
+                    fill_negative=True, fill_alpha=0.2, return_ax=False):
     plt.figure(figsize=figsize)
     ax = plt.gca()
     styles = styles or [None] * len(dfs)
@@ -32,13 +34,26 @@ def plot_population(dfs, labels, styles=None, figsize=(10,6), title='人口趋�
         if df is None:
             continue
         for col in numeric_cols(df):
-            ax.plot(df.index, df[col], label=f'{label} - {col}', linestyle=style)
-    ax.xaxis.set_major_locator(mdates.YearLocator(base=1))
+            series = df[col]
+            ax.plot(df.index, series, label=f'{label} - {col}', linestyle=style)
+            if mark_negative:
+                mask = series < 0
+                if mask.any():
+                    ax.scatter(df.index[mask], series[mask],
+                               color=negative_color, marker=negative_marker, s=20, zorder=5)
+            if fill_negative:
+                ax.fill_between(df.index, series, 0, where=(series < 0),
+                                interpolate=True, color=negative_color, alpha=fill_alpha)
+    ax.xaxis.set_major_locator(mdates.YearLocator(base=3))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    # ax.xaxis.set_minor_locator(mdates.YearLocator(bymonth=(1,5)))  # 可选：每5个月一个次刻度
     plt.legend()
     plt.xlabel('时间')
     plt.ylabel('数值')
     plt.title(title)
     plt.gcf().autofmt_xdate(rotation=45)
     plt.tight_layout()
-    plt.show()
+    fig = plt.gcf()
+    if return_ax:
+        return fig, ax
+    return fig
