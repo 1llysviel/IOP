@@ -13,6 +13,8 @@ POPULATION_2020_FILE = "七-A0202.xls"
 DEATHS_2020_FILE = "七-A0601.xls"
 SEX_RATIO_AT_BIRTH = 105 / 100
 MAX_AGE = 100
+RETIREMENT_AGE = 65
+LIFE_EXPECTANCY = 78
 OBSERVED_POP_FILES = {
     2000: "五-t0201.xls",
     2010: "六-A0201.xls",
@@ -240,15 +242,16 @@ def _series_from_population(pop_df: pd.DataFrame, sex_col: str) -> pd.Series:
 
 def _collect_indicator_row(year: int, total: pd.Series, births: float | None, tfr: float | None) -> dict[str, float]:
     labor_force = total.loc[20:64].sum()
+    retirement_window = total.loc[RETIREMENT_AGE:LIFE_EXPECTANCY].sum()
     row = {
         "年份": year,
         "出生人口": np.nan if births is None else births,
         "TFR": np.nan if tfr is None else tfr,
         "20岁人口": total.loc[20],
-        "50岁人口": total.loc[50],
-        "PSR": total.loc[20:39].sum() / max(total.loc[50:69].sum(), 1.0),
+        "65岁人口": total.loc[RETIREMENT_AGE],
+        "PSR": total.loc[20:39].sum() / max(retirement_window, 1.0),
         "LaborPressure": total.loc[20] / max(labor_force, 1.0),
-        "ODR": total.loc[65:MAX_AGE].sum() / max(labor_force, 1.0),
+        "ODR": retirement_window / max(labor_force, 1.0),
         "CDR": total.loc[0:19].sum() / max(labor_force, 1.0),
     }
     row["TDR"] = row["ODR"] + row["CDR"]
@@ -280,7 +283,7 @@ def _backcast_population(
     return {year: population_by_year[year] for year in (2020,) + target_years}
 
 
-def simulate_bond_population(base_dir: Path, end_year: int = 2060) -> dict[str, object]:
+def simulate_bond_population(base_dir: Path, end_year: int = 2070) -> dict[str, object]:
     pop_groups = load_population_2020(base_dir)
     death_groups = load_deaths_2020(base_dir)
     pop_single = load_population_snapshot(base_dir, 2020)
@@ -345,8 +348,8 @@ def simulate_bond_population(base_dir: Path, end_year: int = 2060) -> dict[str, 
                 "年份": year,
                 "观测20岁人口": observed_row["20岁人口"],
                 "模型20岁人口": model_row["20岁人口"],
-                "观测50岁人口": observed_row["50岁人口"],
-                "模型50岁人口": model_row["50岁人口"],
+                "观测65岁人口": observed_row["65岁人口"],
+                "模型65岁人口": model_row["65岁人口"],
                 "观测PSR": observed_row["PSR"],
                 "模型PSR": model_row["PSR"],
                 "观测ODR": observed_row["ODR"],
@@ -367,21 +370,69 @@ def simulate_bond_population(base_dir: Path, end_year: int = 2060) -> dict[str, 
     }
 
 
+def build_confidence_curve(result: dict[str, object], max_year: int = 2100) -> dict[str, object]:
+    validation = result["validation"].copy()
+    validation["回看年数"] = 2020 - validation["年份"]
+
+    error_rows = []
+    for _, row in validation.iterrows():
+        rel_errors = [
+            abs(row["模型20岁人口"] - row["观测20岁人口"]) / max(row["观测20岁人口"], 1.0),
+            abs(row["模型65岁人口"] - row["观测65岁人口"]) / max(row["观测65岁人口"], 1.0),
+            abs(row["模型PSR"] - row["观测PSR"]) / max(row["观测PSR"], 1e-6),
+            abs(row["模型ODR"] - row["观测ODR"]) / max(row["观测ODR"], 1e-6),
+        ]
+        avg_error = float(np.mean(rel_errors))
+        confidence = float(np.exp(-avg_error))
+        error_rows.append({"回看年数": int(row["回看年数"]), "平均相对误差": avg_error, "经验置信度": confidence})
+
+    anchor = pd.DataFrame([{"回看年数": 0, "平均相对误差": 0.0, "经验置信度": 1.0}])
+    fit_df = pd.concat([anchor, pd.DataFrame(error_rows)], ignore_index=True).sort_values("回看年数")
+
+    c10 = float(fit_df.loc[fit_df["回看年数"] == 10, "经验置信度"].iloc[0])
+    c20 = float(fit_df.loc[fit_df["回看年数"] == 20, "经验置信度"].iloc[0])
+    e10 = max(-np.log(c10), 1e-6)
+    e20 = max(-np.log(c20), e10 + 1e-6)
+    p = np.clip(np.log(e20 / e10) / np.log(2.0), 0.5, 3.0)
+    k = e10 / (10.0**p)
+
+    rows = []
+    for year in range(2020, max_year + 1):
+        horizon = year - 2020
+        confidence = float(np.exp(-(k * (horizon**p)))) if horizon > 0 else 1.0
+        rows.append({"年份": year, "预测年数": horizon, "置信度": confidence})
+    curve = pd.DataFrame(rows)
+
+    recommended = int(curve.loc[curve["置信度"] >= 0.5, "年份"].max())
+    cautious = int(curve.loc[curve["置信度"] >= 0.3, "年份"].max())
+    return {
+        "fit_points": fit_df,
+        "curve": curve,
+        "recommended_year": recommended,
+        "cautious_year": cautious,
+        "params": {"k": float(k), "p": float(p)},
+    }
+
+
 def print_bond_summary(result: dict[str, object]) -> None:
     metrics = result["metrics"]
     validation = result["validation"]
+    confidence = build_confidence_curve(result)
     print("人口超长期债券模型摘要：")
-    print(f"- 2021-2050 年 TFR 均值: {metrics['TFR'].mean():.3f}")
-    print(f"- 2021-2050 年平均出生人口: {metrics['出生人口'].mean():.0f}")
-    for year in (2030, 2050, 2060):
+    print(f"- 2021-2070 年 TFR 均值: {metrics['TFR'].mean():.3f}")
+    print(f"- 2021-2070 年平均出生人口: {metrics['出生人口'].mean():.0f}")
+    for year in (2030, 2050, 2060, 2070):
         row = metrics.loc[metrics["年份"] == year].iloc[0]
-        print(f"- {year} 年: 20岁人口 {row['20岁人口']:.0f}, 50岁人口 {row['50岁人口']:.0f}, PSR {row['PSR']:.3f}, TDR {row['TDR']:.3f}")
+        conf = confidence["curve"].loc[confidence["curve"]["年份"] == year, "置信度"].iloc[0]
+        print(f"- {year} 年: 20岁人口 {row['20岁人口']:.0f}, 65岁人口 {row['65岁人口']:.0f}, PSR {row['PSR']:.3f}, TDR {row['TDR']:.3f}, 置信度 {conf:.3f}")
     print(f"- 2050 年 20岁人口: {metrics.loc[metrics['年份'] == 2050, '20岁人口'].iloc[0]:.0f}")
-    print(f"- 2050 年 50岁人口: {metrics.loc[metrics['年份'] == 2050, '50岁人口'].iloc[0]:.0f}")
+    print(f"- 2050 年 65岁人口: {metrics.loc[metrics['年份'] == 2050, '65岁人口'].iloc[0]:.0f}")
     print(f"- 2050 年 PSR: {metrics.loc[metrics['年份'] == 2050, 'PSR'].iloc[0]:.3f}")
     print(f"- 2050 年 ODR: {metrics.loc[metrics['年份'] == 2050, 'ODR'].iloc[0]:.3f}")
     print(f"- 2050 年 CDR: {metrics.loc[metrics['年份'] == 2050, 'CDR'].iloc[0]:.3f}")
     print(f"- 2050 年 TDR: {metrics.loc[metrics['年份'] == 2050, 'TDR'].iloc[0]:.3f}")
+    print(f"- 建议推演上限（置信度>=0.50）: {confidence['recommended_year']} 年")
+    print(f"- 谨慎观察上限（置信度>=0.30）: {confidence['cautious_year']} 年")
     print("回看验证（以 2020 为基年反推）：")
     print(validation.to_string(index=False))
 
@@ -390,6 +441,7 @@ def plot_bond_dashboard(result: dict[str, object]) -> None:
     metrics = result["metrics"]
     history_births = result["history_births"]
     validation = result["validation"]
+    confidence = build_confidence_curve(result, max_year=max(2100, int(metrics["年份"].max())))
 
     plt.figure(figsize=(10, 6))
     plt.plot(history_births["年份"], history_births["出生人口"], marker="o", linewidth=2, label="历史出生人口")
@@ -404,9 +456,9 @@ def plot_bond_dashboard(result: dict[str, object]) -> None:
 
     plt.figure(figsize=(10, 6))
     plt.plot(metrics["年份"], metrics["20岁人口"], linewidth=2, label="20岁人口")
-    plt.plot(metrics["年份"], metrics["50岁人口"], linewidth=2, linestyle="--", label="50岁人口")
+    plt.plot(metrics["年份"], metrics["65岁人口"], linewidth=2, linestyle="--", label="65岁人口")
     plt.scatter(validation["年份"], validation["观测20岁人口"], color="tab:blue", marker="x", s=60, label="观测20岁人口")
-    plt.scatter(validation["年份"], validation["观测50岁人口"], color="tab:orange", marker="x", s=60, label="观测50岁人口")
+    plt.scatter(validation["年份"], validation["观测65岁人口"], color="tab:orange", marker="x", s=60, label="观测65岁人口")
     plt.title("代际对比图")
     plt.xlabel("年份")
     plt.ylabel("人口规模")
@@ -434,6 +486,22 @@ def plot_bond_dashboard(result: dict[str, object]) -> None:
     plt.title("债券期限结构与劳动力压力")
     plt.xlabel("年份")
     plt.ylabel("指标值")
+    plt.grid(alpha=0.2)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(confidence["curve"]["年份"], confidence["curve"]["置信度"], linewidth=2, label="置信度曲线")
+    plt.axhline(0.5, color="tab:orange", linestyle="--", alpha=0.7, label="建议阈值 0.50")
+    plt.axhline(0.3, color="tab:red", linestyle=":", alpha=0.7, label="谨慎阈值 0.30")
+    for year in (2030, 2050, 2060, 2070):
+        if year in confidence["curve"]["年份"].values:
+            value = confidence["curve"].loc[confidence["curve"]["年份"] == year, "置信度"].iloc[0]
+            plt.scatter([year], [value], s=50, zorder=5)
+    plt.title("模型置信度曲线")
+    plt.xlabel("年份")
+    plt.ylabel("置信度")
     plt.grid(alpha=0.2)
     plt.legend()
     plt.tight_layout()
